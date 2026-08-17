@@ -443,11 +443,13 @@ async def edit_existing_anketa(callback: types.CallbackQuery, state: FSMContext)
     if not active:
         await callback.message.edit_text("❌ Активная анкета не найдена.")
         return
-    # Сохраняем ID старой анкеты, чтобы потом заменить её
+    # Удаляем старое сообщение с inline-кнопками
+    await callback.message.delete()
+    # Сохраняем ID старой анкеты и начинаем редактирование
     await state.clear()
     await state.set_state(RegisterForm.gender)
     await state.update_data(history=[], old_anketa_id=active['id'])
-    await callback.message.edit_text(
+    await callback.message.answer(
         "📝 Редактирование анкеты. Заполните все поля заново.\n\n"
         "Выберите ваш пол:",
         reply_markup=gender_kb
@@ -456,7 +458,8 @@ async def edit_existing_anketa(callback: types.CallbackQuery, state: FSMContext)
 @dp.callback_query(lambda c: c.data == "cancel_edit")
 async def cancel_edit(callback: types.CallbackQuery):
     await callback.answer()
-    await callback.message.edit_text("❌ Действие отменено.", reply_markup=main_menu_kb)
+    await callback.message.delete()
+    await callback.message.answer("❌ Действие отменено.", reply_markup=main_menu_kb)
 
 @dp.message(lambda msg: msg.text == "👤 Моя анкета")
 async def show_my_anketa(message: types.Message):
@@ -509,7 +512,6 @@ async def show_my_anketa(message: types.Message):
         ]
     )
 
-    # Отправляем фото, если есть
     if public_photo:
         await message.answer_photo(
             photo=public_photo,
