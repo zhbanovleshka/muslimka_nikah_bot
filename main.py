@@ -945,6 +945,7 @@ async def publish_to_channel(data: dict):
 
 # ------------------ ЛАЙКИ (с кнопкой покупки фото) ------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("like_"))
+@dp.callback_query(lambda c: c.data and c.data.startswith("like_"))
 async def process_like(callback: types.CallbackQuery):
     try:
         await callback.answer()
@@ -952,12 +953,12 @@ async def process_like(callback: types.CallbackQuery):
         from_user_id = callback.from_user.id
 
         if from_user_id == target_user_id:
-            await callback.message.answer("❌ Нельзя лайкать свою анкету.")
+            await bot.send_message(from_user_id, "❌ Нельзя лайкать свою анкету.")
             return
 
         target_data = get_user_by_id(target_user_id)
         if not target_data or target_data[16] != 'approved':
-            await callback.message.answer("❌ Анкета не найдена или ещё не опубликована.")
+            await bot.send_message(from_user_id, "❌ Анкета не найдена или ещё не опубликована.")
             return
 
         # Проверяем взаимность
@@ -965,29 +966,29 @@ async def process_like(callback: types.CallbackQuery):
         if mutual:
             from_data = get_user_by_id(from_user_id)
             if from_data and "Мужской" in from_data[2]:
-                await callback.message.answer("❤️ У вас уже есть взаимность с этим пользователем. Вы можете оплатить контакт.")
+                await bot.send_message(from_user_id, "❤️ У вас уже есть взаимность с этим пользователем. Вы можете оплатить контакт.")
             else:
-                await callback.message.answer("❤️ Вы уже одобрили этого пользователя. Взаимность установлена.")
+                await bot.send_message(from_user_id, "❤️ Вы уже одобрили этого пользователя. Взаимность установлена.")
             return
 
         existing = get_like(from_user_id, target_user_id)
         if existing:
             status = existing[3]
             if status == 'pending':
-                await callback.message.answer("⏳ Вы уже отправили запрос этому пользователю. Ожидайте ответа.")
+                await bot.send_message(from_user_id, "⏳ Вы уже отправили запрос этому пользователю. Ожидайте ответа.")
             elif status == 'approved':
-                await callback.message.answer("❤️ Взаимность уже подтверждена! Вы можете оплатить контакт.")
+                await bot.send_message(from_user_id, "❤️ Взаимность уже подтверждена! Вы можете оплатить контакт.")
             elif status == 'rejected':
-                await callback.message.answer("❌ Пользователь отклонил ваш запрос ранее.")
+                await bot.send_message(from_user_id, "❌ Пользователь отклонил ваш запрос ранее.")
             return
 
         from_data = get_user_by_id(from_user_id)
         if not from_data:
-            await callback.message.answer("❌ Ваша анкета не найдена. Заполните анкету через /start.")
+            await bot.send_message(from_user_id, "❌ Ваша анкета не найдена. Заполните анкету через /start.")
             return
 
         if not save_like(from_user_id, target_user_id):
-            await callback.message.answer("❌ Ошибка при сохранении лайка.")
+            await bot.send_message(from_user_id, "❌ Ошибка при сохранении лайка.")
             return
 
         target_gender = target_data[2]
@@ -1033,7 +1034,7 @@ async def process_like(callback: types.CallbackQuery):
                 reply_markup=kb
             )
 
-        # Сообщение мужчине с кнопкой покупки фото
+        # Сообщение мужчине с кнопкой покупки фото (отправляем в личку)
         woman_data = get_user_by_id(target_user_id)
         woman_name = woman_data[3] if woman_data else ""
         woman_name = woman_name[0].upper() + woman_name[1:] if woman_name else "девушки"
@@ -1042,15 +1043,16 @@ async def process_like(callback: types.CallbackQuery):
                 [InlineKeyboardButton(text="👀 Купить фото за 100 руб.", callback_data=f"buyphoto_{target_user_id}_{from_user_id}")]
             ]
         )
-        await callback.message.answer(
-            f"✅ Запрос отправлен {recipient_text}. Ожидайте ответа.\n\n"
-            f"Если вы хотите увидеть фото с лицом {woman_name} прямо сейчас, вы можете купить его за 100 руб. Оно будет доступно только вам.",
+        await bot.send_message(
+            chat_id=from_user_id,
+            text=f"✅ Запрос отправлен {recipient_text}. Ожидайте ответа.\n\n"
+                 f"Если вы хотите увидеть фото с лицом {woman_name} прямо сейчас, вы можете купить его за 100 руб. Оно будет доступно только вам.",
             reply_markup=photo_kb
         )
 
     except Exception as e:
         logging.error(f"Ошибка в process_like: {e}")
-        await callback.message.answer("❌ Произошла ошибка. Попробуйте позже.")
+        await bot.send_message(from_user_id, "❌ Произошла ошибка. Попробуйте позже.")
 
 # ------------------ ОДОБРЕНИЕ ЛАЙКА ------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("approvelike_"))
