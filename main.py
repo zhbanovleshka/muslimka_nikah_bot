@@ -278,7 +278,7 @@ storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
-# ------------------ КЛАВИАТУРЫ (без изменений) ------------------
+# ------------------ КЛАВИАТУРЫ ------------------
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Заполнить анкету")],
@@ -387,7 +387,7 @@ class RegisterForm(StatesGroup):
     private_photo = State()
     waiting_confirm = State()
 
-# ------------------ ХЭНДЛЕРЫ РЕГИСТРАЦИИ (без изменений) ------------------
+# ------------------ ХЭНДЛЕРЫ РЕГИСТРАЦИИ ------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -1296,10 +1296,14 @@ async def process_pay_contact(callback: types.CallbackQuery):
             service_data=service_data
         )
         if payment_url:
+            pay_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text=f"💳 Оплатить {price} руб.", url=payment_url)]
+                ]
+            )
             await callback.message.answer(
-                f"💳 Для оплаты контакта перейдите по ссылке:\n{payment_url}\n\n"
-                f"Сумма: {price} руб.\n"
-                f"После оплаты чат будет создан автоматически."
+                f"💳 Для оплаты контакта нажмите кнопку ниже.\nСумма: {price} руб.\n\nПосле оплаты чат будет создан автоматически.",
+                reply_markup=pay_kb
             )
             await callback.message.delete()
         else:
@@ -1338,10 +1342,14 @@ async def buy_photo(callback: types.CallbackQuery):
             service_data=service_data
         )
         if payment_url:
+            pay_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Оплатить 100 руб.", url=payment_url)]
+                ]
+            )
             await callback.message.answer(
-                f"💳 Для оплаты фото перейдите по ссылке:\n{payment_url}\n\n"
-                f"Сумма: 100 руб.\n"
-                f"После оплаты фото будет отправлено."
+                "💳 Для покупки фото нажмите кнопку ниже.\nСумма: 100 руб.\n\nПосле оплаты фото будет отправлено.",
+                reply_markup=pay_kb
             )
         else:
             await callback.message.answer("❌ Ошибка при создании платежа. Попробуйте позже.")
@@ -1365,9 +1373,14 @@ async def test_pay(message: types.Message):
             service_data="test"
         )
         if payment_url:
+            pay_kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="💳 Оплатить 10 руб.", url=payment_url)]
+                ]
+            )
             await message.answer(
-                f"💳 Тестовый платёж на 10 рублей.\n"
-                f"Перейдите по ссылке для оплаты:\n{payment_url}"
+                "💳 Тестовый платёж на 10 рублей.\nНажмите кнопку для оплаты.",
+                reply_markup=pay_kb
             )
         else:
             await message.answer("❌ Ошибка при создании тестового платежа.")
