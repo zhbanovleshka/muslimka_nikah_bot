@@ -41,7 +41,6 @@ if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
 if not DATABASE_URL:
     print("⚠️ DATABASE_URL не указан, бот будет работать без БД")
 
-# Настройка ЮKassa
 if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
     Configuration.account_id = YOOKASSA_SHOP_ID
     Configuration.secret_key = YOOKASSA_SECRET_KEY
@@ -51,7 +50,7 @@ storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
 
-# ------------------ КЛАСС ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ------------------
+# ------------------ БАЗА ДАННЫХ ------------------
 class Database:
     def __init__(self, dsn):
         self.dsn = dsn
@@ -74,7 +73,6 @@ class Database:
 
 db = Database(DATABASE_URL) if DATABASE_URL else None
 
-# ------------------ ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ ------------------
 async def init_db():
     if not db:
         return
@@ -133,9 +131,9 @@ async def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    logging.info("Таблицы созданы/проверены в Supabase")
+    logging.info("Таблицы созданы/проверены")
 
-# ------------------ ФУНКЦИИ РАБОТЫ С БАЗОЙ ------------------
+# ------------------ ФУНКЦИИ БАЗЫ ДАННЫХ ------------------
 async def save_anketa(data: dict, user_id: int):
     if not db:
         return
@@ -181,11 +179,24 @@ async def update_status(user_id: int, status: str):
         )
     """, status, user_id)
 
+async def update_status_by_id(anketa_id: int, status: str):
+    if not db:
+        return
+    await db.execute("UPDATE users SET status = $1 WHERE id = $2", status, anketa_id)
+
 async def get_anketa(user_id: int):
     if not db:
         return None
     return await db.fetchrow(
         "SELECT * FROM users WHERE user_id = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+        user_id
+    )
+
+async def get_user_active_anketa(user_id: int):
+    if not db:
+        return None
+    return await db.fetchrow(
+        "SELECT * FROM users WHERE user_id = $1 AND status IN ('pending', 'approved') ORDER BY created_at DESC LIMIT 1",
         user_id
     )
 
@@ -279,10 +290,11 @@ async def delete_pending_payment(payment_id: str):
         payment_id
     )
 
-# ------------------ КЛАВИАТУРЫ (без изменений) ------------------
+# ------------------ КЛАВИАТУРЫ ------------------
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Заполнить анкету")],
+        [KeyboardButton(text="👤 Моя анкета")],
         [KeyboardButton(text="❓ Помощь")],
         [KeyboardButton(text="🚫 Отменить")]
     ],
@@ -388,7 +400,7 @@ class RegisterForm(StatesGroup):
     private_photo = State()
     waiting_confirm = State()
 
-# ------------------ ХЭНДЛЕРЫ РЕГИСТРАЦИИ ------------------
+# ------------------ ХЭНДЛЕРЫ ------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -401,6 +413,20 @@ async def cmd_start(message: types.Message):
 
 @dp.message(lambda msg: msg.text == "📝 Заполнить анкету")
 async def start_register(message: types.Message, state: FSMContext):
+    active = await get_user_active_anketa(message.from_user.id)
+    if active:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Редактировать", callback_data="edit_existing")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_edit")]
+            ]
+        )
+        await message.answer(
+            "📌 У вас уже есть анкета. Вы можете отредактировать её (старая будет заменена) или отменить действие.",
+            reply_markup=kb
+        )
+        return
+
     await state.clear()
     await state.set_state(RegisterForm.gender)
     await state.update_data(history=[])
@@ -409,6 +435,78 @@ async def start_register(message: types.Message, state: FSMContext):
         "Выберите ваш пол:",
         reply_markup=gender_kb
     )
+
+@dp.callback_query(lambda c: c.data == "edit_existing")
+async def edit_existing_anketa(callback: types.CallbackQuery, state: FSMContext):
+    await callback.answer()
+    active = await get_user_active_anketa(callback.from_user.id)
+    if not active:
+        await callback.message.edit_text("❌ Активная анкета не найдена.")
+        return
+    await state.clear()
+    await state.set_state(RegisterForm.gender)
+    await state.update_data(history=[], old_anketa_id=active['id'])
+    await callback.message.edit_text(
+        "📝 Редактирование анкеты. Заполните все поля заново.\n\n"
+        "Выберите ваш пол:",
+        reply_markup=gender_kb
+    )
+
+@dp.callback_query(lambda c: c.data == "cancel_edit")
+async def cancel_edit(callback: types.CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text("❌ Действие отменено.", reply_markup=main_menu_kb)
+
+@dp.message(lambda msg: msg.text == "👤 Моя анкета")
+async def show_my_anketa(message: types.Message):
+    user_id = message.from_user.id
+    anketa = await get_user_active_anketa(user_id)
+    if not anketa:
+        await message.answer("❌ У вас нет активной анкеты. Заполните её через «Заполнить анкету».", reply_markup=main_menu_kb)
+        return
+
+    gender = anketa.get('gender', 'Не указан')
+    name = anketa.get('name', '—')
+    age = anketa.get('age', '—')
+    height = anketa.get('height', '—')
+    weight = anketa.get('weight', '—')
+    city = anketa.get('city', '—')
+    nationality = anketa.get('nationality', '—')
+    marital = anketa.get('marital', '—')
+    religiosity = anketa.get('religiosity', '—')
+    islam_since = anketa.get('islam_since', '—')
+    about = anketa.get('about', '—')
+    children = anketa.get('children', '—')
+    seeking = anketa.get('seeking', '—')
+    status = anketa.get('status', 'pending')
+    status_text = "✅ Одобрена" if status == "approved" else "⏳ На модерации"
+
+    text = (
+        f"📋 <b>Ваша анкета</b>\n\n"
+        f"⚧ Пол: {gender}\n"
+        f"👤 Имя: {name}\n"
+        f"🎂 Возраст: {age}\n"
+        f"📏 Рост: {height} см, Вес: {weight} кг\n"
+        f"📍 Город: {city}\n"
+        f"🌍 Национальность: {nationality}\n"
+        f"💍 Семейное положение: {marital}\n"
+        f"🕌 Религиозность: {religiosity}\n"
+        f"📖 Ислам с: {islam_since}\n"
+        f"📝 О себе: {about}\n"
+        f"👶 Дети: {children}\n"
+        f"❤️ Ищу: {seeking}\n"
+        f"📌 Статус: {status_text}\n"
+    )
+    if status == "approved" and anketa.get('post_message_id'):
+        post_id = anketa['post_message_id']
+        text += f"\n🔗 Ваша анкета опубликована в канале: https://t.me/{CHANNEL_ID.replace('@','')}/{post_id}"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✏️ Изменить анкету", callback_data="edit_existing")]
+        ]
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @dp.message(lambda msg: msg.text == "❓ Помощь")
 async def show_help(message: types.Message):
@@ -733,8 +831,20 @@ async def submit_anketa(callback: types.CallbackQuery, state: FSMContext):
             price_category = "0"
 
         data['price_category'] = price_category
-        await save_anketa(data, user_id)
 
+        # Если есть старая анкета – заменяем
+        old_id = data.get('old_anketa_id')
+        if old_id:
+            await update_status_by_id(old_id, 'replaced')
+            # Удаляем пост из канала, если он был
+            old = await db.fetchrow("SELECT post_message_id FROM users WHERE id = $1", old_id)
+            if old and old.get('post_message_id'):
+                try:
+                    await bot.delete_message(chat_id=CHANNEL_ID, message_id=old['post_message_id'])
+                except:
+                    pass
+
+        await save_anketa(data, user_id)
         asyncio.create_task(send_to_admin(data, user_id))
 
         await callback.message.edit_text(
@@ -961,7 +1071,6 @@ async def process_like(callback: types.CallbackQuery):
             await bot.send_message(from_user_id, "❌ Анкета не найдена или ещё не опубликована.")
             return
 
-        # Проверяем взаимность
         mutual = await get_any_like_between(from_user_id, target_user_id)
         if mutual:
             from_data = await get_user_by_id(from_user_id)
@@ -1399,7 +1508,6 @@ async def main():
     if db:
         await db.connect()
         await init_db()
-    # Запускаем webhook-сервер
     app = web.Application()
     app.router.add_post('/yookassa_webhook', handle_yookassa_webhook)
     runner = web.AppRunner(app)
@@ -1408,7 +1516,6 @@ async def main():
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"Webhook-сервер запущен на порту {port}")
-    # Запускаем бота
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
