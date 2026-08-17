@@ -443,6 +443,7 @@ async def edit_existing_anketa(callback: types.CallbackQuery, state: FSMContext)
     if not active:
         await callback.message.edit_text("❌ Активная анкета не найдена.")
         return
+    # Сохраняем ID старой анкеты, чтобы потом заменить её
     await state.clear()
     await state.set_state(RegisterForm.gender)
     await state.update_data(history=[], old_anketa_id=active['id'])
@@ -480,6 +481,7 @@ async def show_my_anketa(message: types.Message):
     seeking = anketa.get('seeking', '—')
     status = anketa.get('status', 'pending')
     status_text = "✅ Одобрена" if status == "approved" else "⏳ На модерации"
+    public_photo = anketa.get('public_photo')
 
     text = (
         f"📋 <b>Ваша анкета</b>\n\n"
@@ -506,7 +508,17 @@ async def show_my_anketa(message: types.Message):
             [InlineKeyboardButton(text="✏️ Изменить анкету", callback_data="edit_existing")]
         ]
     )
-    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+    # Отправляем фото, если есть
+    if public_photo:
+        await message.answer_photo(
+            photo=public_photo,
+            caption=text,
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+    else:
+        await message.answer(text, parse_mode="HTML", reply_markup=kb)
 
 @dp.message(lambda msg: msg.text == "❓ Помощь")
 async def show_help(message: types.Message):
@@ -832,11 +844,9 @@ async def submit_anketa(callback: types.CallbackQuery, state: FSMContext):
 
         data['price_category'] = price_category
 
-        # Если есть старая анкета – заменяем
         old_id = data.get('old_anketa_id')
         if old_id:
             await update_status_by_id(old_id, 'replaced')
-            # Удаляем пост из канала, если он был
             old = await db.fetchrow("SELECT post_message_id FROM users WHERE id = $1", old_id)
             if old and old.get('post_message_id'):
                 try:
