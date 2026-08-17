@@ -1184,7 +1184,7 @@ async def create_yookassa_payment(amount: float, description: str, user_id: int,
     Создаёт платёж в ЮKassa и возвращает ссылку для оплаты.
     """
     try:
-        # Создаём платёж
+        # Создаём платёж с фиксированным return_url (юзернейм вашего бота)
         payment = Payment.create({
             "amount": {
                 "value": f"{amount:.2f}",
@@ -1192,7 +1192,7 @@ async def create_yookassa_payment(amount: float, description: str, user_id: int,
             },
             "confirmation": {
                 "type": "redirect",
-                "return_url": f"https://t.me/{bot.username}"
+                "return_url": "https://t.me/MuslimkaNikahBot"  # замените на ваш юзернейм бота, если он отличается
             },
             "capture": True,
             "description": description,
@@ -1203,7 +1203,6 @@ async def create_yookassa_payment(amount: float, description: str, user_id: int,
             }
         })
         payment_id = payment.id
-        # Сохраняем в таблицу pending_payments
         save_pending_payment(payment_id, user_id, service_type, service_data)
         return payment.confirmation.confirmation_url
     except Exception as e:
