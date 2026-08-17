@@ -3,23 +3,22 @@ import logging
 import os
 import sys
 import re
-import sqlite3
 from datetime import datetime, timedelta
-import json
 
+import asyncpg
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
+    InlineKeyboardMarkup, InlineKeyboardButton
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from dotenv import load_dotenv
-
-# Импорты для API ЮKassa и webhook-сервера
-from yookassa import Configuration, Payment, Webhook
-from aiohttp import web, ClientSession
-import asyncio
+from yookassa import Configuration, Payment
+from aiohttp import web
 
 # ------------------ КОНФИГУРАЦИЯ ------------------
 ADMIN_ID = 850409726
@@ -28,29 +27,61 @@ CHANNEL_ID = "@MuslimkaNikah"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
 load_dotenv(ENV_PATH)
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
 YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not BOT_TOKEN:
-    print("❌ Токен бота не найден в .env")
+    print("❌ Токен бота не найден")
     sys.exit(1)
 if not YOOKASSA_SHOP_ID or not YOOKASSA_SECRET_KEY:
-    print("⚠️ YOOKASSA_SHOP_ID или YOOKASSA_SECRET_KEY не найдены. Оплата не будет работать.")
+    print("⚠️ ЮKassa не настроена")
+if not DATABASE_URL:
+    print("⚠️ DATABASE_URL не указан, бот будет работать без БД")
 
-# Настраиваем ЮKassa
+# Настройка ЮKassa
 if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
     Configuration.account_id = YOOKASSA_SHOP_ID
     Configuration.secret_key = YOOKASSA_SECRET_KEY
 
-# ------------------ БАЗА ДАННЫХ ------------------
-def init_db():
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("""
+logging.basicConfig(level=logging.INFO)
+storage = MemoryStorage()
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=storage)
+
+# ------------------ КЛАСС ДЛЯ РАБОТЫ С БАЗОЙ ДАННЫХ ------------------
+class Database:
+    def __init__(self, dsn):
+        self.dsn = dsn
+        self.pool = None
+
+    async def connect(self):
+        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+
+    async def execute(self, query, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.execute(query, *args)
+
+    async def fetch(self, query, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(query, *args)
+
+    async def fetchrow(self, query, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(query, *args)
+
+db = Database(DATABASE_URL) if DATABASE_URL else None
+
+# ------------------ ИНИЦИАЛИЗАЦИЯ ТАБЛИЦ ------------------
+async def init_db():
+    if not db:
+        return
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
             gender TEXT,
             name TEXT,
             age INTEGER,
@@ -73,66 +104,49 @@ def init_db():
             children TEXT
         )
     """)
-    cur.execute("PRAGMA table_info(users)")
-    columns = [col[1] for col in cur.fetchall()]
-    if "post_message_id" not in columns:
-        cur.execute("ALTER TABLE users ADD COLUMN post_message_id INTEGER")
-    if "nationality" not in columns:
-        cur.execute("ALTER TABLE users ADD COLUMN nationality TEXT")
-    if "islam_since" not in columns:
-        cur.execute("ALTER TABLE users ADD COLUMN islam_since TEXT")
-    if "children" not in columns:
-        cur.execute("ALTER TABLE users ADD COLUMN children TEXT")
-
-    cur.execute("""
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS likes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_user_id INTEGER,
-            to_user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            from_user_id BIGINT NOT NULL,
+            to_user_id BIGINT NOT NULL,
             status TEXT DEFAULT 'pending',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(from_user_id, to_user_id)
         )
     """)
-
-    cur.execute("""
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS paid_contacts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            buyer_id INTEGER,
-            seller_id INTEGER,
-            chat_id INTEGER,
-            expires_at TIMESTAMP,
+            id SERIAL PRIMARY KEY,
+            buyer_id BIGINT NOT NULL,
+            seller_id BIGINT NOT NULL,
+            chat_id BIGINT NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    # Таблица для хранения временных платежей (чтобы связать оплату с услугой)
-    cur.execute("""
+    await db.execute("""
         CREATE TABLE IF NOT EXISTS pending_payments (
             payment_id TEXT PRIMARY KEY,
-            user_id INTEGER,
-            service_type TEXT,
+            user_id BIGINT NOT NULL,
+            service_type TEXT NOT NULL,
             service_data TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
-
-    conn.commit()
-    conn.close()
-
-init_db()
+    logging.info("Таблицы созданы/проверены в Supabase")
 
 # ------------------ ФУНКЦИИ РАБОТЫ С БАЗОЙ ------------------
-def save_anketa(data: dict, user_id: int):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("""
+async def save_anketa(data: dict, user_id: int):
+    if not db:
+        return
+    query = """
         INSERT INTO users (
             user_id, gender, name, age, height, weight, city, marital, intimate,
             religiosity, about, seeking, public_photo, private_photo, price_category, status,
             nationality, islam_since, children
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+    """
+    await db.execute(query,
         user_id,
         data.get('gender'),
         data.get('name'),
@@ -152,133 +166,120 @@ def save_anketa(data: dict, user_id: int):
         data.get('nationality'),
         data.get('islam_since'),
         data.get('children')
-    ))
-    conn.commit()
-    conn.close()
+    )
 
-def update_status(user_id: int, status: str):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("""
+async def update_status(user_id: int, status: str):
+    if not db:
+        return
+    await db.execute("""
         UPDATE users 
-        SET status = ? 
+        SET status = $1
         WHERE id = (
             SELECT id FROM users 
-            WHERE user_id = ? AND status = 'pending' 
+            WHERE user_id = $2 AND status = 'pending' 
             ORDER BY created_at DESC LIMIT 1
         )
-    """, (status, user_id))
-    conn.commit()
-    conn.close()
+    """, status, user_id)
 
-def get_anketa(user_id: int):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+async def get_anketa(user_id: int):
+    if not db:
+        return None
+    return await db.fetchrow(
+        "SELECT * FROM users WHERE user_id = $1 AND status = 'pending' ORDER BY created_at DESC LIMIT 1",
+        user_id
+    )
 
-def get_user_by_id(user_id: int):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE user_id = ? ORDER BY created_at DESC LIMIT 1", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+async def get_user_by_id(user_id: int):
+    if not db:
+        return None
+    return await db.fetchrow(
+        "SELECT * FROM users WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+        user_id
+    )
 
-def update_post_message_id(user_id: int, post_id: int):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("""
+async def update_post_message_id(user_id: int, post_id: int):
+    if not db:
+        return
+    await db.execute("""
         UPDATE users 
-        SET post_message_id = ? 
+        SET post_message_id = $1
         WHERE id = (
             SELECT id FROM users 
-            WHERE user_id = ? AND status = 'approved' 
+            WHERE user_id = $2 AND status = 'approved' 
             ORDER BY created_at DESC LIMIT 1
         )
-    """, (post_id, user_id))
-    conn.commit()
-    conn.close()
+    """, post_id, user_id)
 
-def save_like(from_user: int, to_user: int):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
+async def save_like(from_user: int, to_user: int):
+    if not db:
+        return False
     try:
-        cur.execute("INSERT INTO likes (from_user_id, to_user_id, status) VALUES (?, ?, 'pending')", (from_user, to_user))
-        conn.commit()
-        conn.close()
+        await db.execute(
+            "INSERT INTO likes (from_user_id, to_user_id, status) VALUES ($1, $2, 'pending')",
+            from_user, to_user
+        )
         return True
-    except sqlite3.IntegrityError:
-        conn.close()
+    except asyncpg.UniqueViolationError:
         return False
 
-def update_like_status(from_user: int, to_user: int, status: str):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("UPDATE likes SET status = ? WHERE from_user_id = ? AND to_user_id = ?", (status, from_user, to_user))
-    conn.commit()
-    conn.close()
+async def update_like_status(from_user: int, to_user: int, status: str):
+    if not db:
+        return
+    await db.execute(
+        "UPDATE likes SET status = $1 WHERE from_user_id = $2 AND to_user_id = $3",
+        status, from_user, to_user
+    )
 
-def get_like(from_user: int, to_user: int):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM likes WHERE from_user_id = ? AND to_user_id = ?", (from_user, to_user))
-    row = cur.fetchone()
-    conn.close()
-    return row
+async def get_like(from_user: int, to_user: int):
+    if not db:
+        return None
+    return await db.fetchrow(
+        "SELECT * FROM likes WHERE from_user_id = $1 AND to_user_id = $2",
+        from_user, to_user
+    )
 
-def get_any_like_between(user1: int, user2: int):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("""
+async def get_any_like_between(user1: int, user2: int):
+    if not db:
+        return None
+    return await db.fetchrow("""
         SELECT * FROM likes 
-        WHERE (from_user_id = ? AND to_user_id = ? OR from_user_id = ? AND to_user_id = ?)
+        WHERE (from_user_id = $1 AND to_user_id = $2 OR from_user_id = $2 AND to_user_id = $1)
         AND status = 'approved'
-    """, (user1, user2, user2, user1))
-    row = cur.fetchone()
-    conn.close()
-    return row
+    """, user1, user2)
 
-def save_paid_contact(buyer_id: int, seller_id: int, chat_id: int, expires_at: datetime):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("INSERT INTO paid_contacts (buyer_id, seller_id, chat_id, expires_at) VALUES (?, ?, ?, ?)",
-                (buyer_id, seller_id, chat_id, expires_at))
-    conn.commit()
-    conn.close()
+async def save_paid_contact(buyer_id: int, seller_id: int, chat_id: int, expires_at: datetime):
+    if not db:
+        return
+    await db.execute(
+        "INSERT INTO paid_contacts (buyer_id, seller_id, chat_id, expires_at) VALUES ($1, $2, $3, $4)",
+        buyer_id, seller_id, chat_id, expires_at
+    )
 
-def save_pending_payment(payment_id: str, user_id: int, service_type: str, service_data: str):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("INSERT OR REPLACE INTO pending_payments (payment_id, user_id, service_type, service_data) VALUES (?, ?, ?, ?)",
-                (payment_id, user_id, service_type, service_data))
-    conn.commit()
-    conn.close()
+async def save_pending_payment(payment_id: str, user_id: int, service_type: str, service_data: str):
+    if not db:
+        return
+    await db.execute(
+        "INSERT INTO pending_payments (payment_id, user_id, service_type, service_data) VALUES ($1, $2, $3, $4)",
+        payment_id, user_id, service_type, service_data
+    )
 
-def get_pending_payment(payment_id: str):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM pending_payments WHERE payment_id = ?", (payment_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+async def get_pending_payment(payment_id: str):
+    if not db:
+        return None
+    return await db.fetchrow(
+        "SELECT * FROM pending_payments WHERE payment_id = $1",
+        payment_id
+    )
 
-def delete_pending_payment(payment_id: str):
-    conn = sqlite3.connect("ankets.db")
-    cur = conn.cursor()
-    cur.execute("DELETE FROM pending_payments WHERE payment_id = ?", (payment_id,))
-    conn.commit()
-    conn.close()
+async def delete_pending_payment(payment_id: str):
+    if not db:
+        return
+    await db.execute(
+        "DELETE FROM pending_payments WHERE payment_id = $1",
+        payment_id
+    )
 
-# ------------------ НАСТРОЙКА БОТА ------------------
-logging.basicConfig(level=logging.INFO)
-storage = MemoryStorage()
-bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher(storage=storage)
-
-# ------------------ КЛАВИАТУРЫ ------------------
+# ------------------ КЛАВИАТУРЫ (без изменений) ------------------
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📝 Заполнить анкету")],
@@ -368,7 +369,7 @@ confirm_kb = InlineKeyboardMarkup(
     ]
 )
 
-# ------------------ СОСТОЯНИЯ ------------------
+# ------------------ СОСТОЯНИЯ РЕГИСТРАЦИИ ------------------
 class RegisterForm(StatesGroup):
     gender = State()
     name = State()
@@ -732,7 +733,7 @@ async def submit_anketa(callback: types.CallbackQuery, state: FSMContext):
             price_category = "0"
 
         data['price_category'] = price_category
-        save_anketa(data, user_id)
+        await save_anketa(data, user_id)
 
         asyncio.create_task(send_to_admin(data, user_id))
 
@@ -805,7 +806,7 @@ async def approve_anketa(callback: types.CallbackQuery):
     try:
         await callback.answer()
         user_id = int(callback.data.split("_")[1])
-        row = get_anketa(user_id)
+        row = await get_anketa(user_id)
         if not row:
             await callback.message.edit_caption(
                 caption="❌ Анкета не найдена или уже обработана.",
@@ -814,27 +815,27 @@ async def approve_anketa(callback: types.CallbackQuery):
             return
 
         data = {
-            'user_id': row[1],
-            'gender': row[2],
-            'name': row[3],
-            'age': row[4],
-            'height': row[5],
-            'weight': row[6],
-            'city': row[7],
-            'marital': row[8],
-            'intimate': row[9],
-            'religiosity': row[10],
-            'about': row[11],
-            'seeking': row[12],
-            'public_photo': row[13],
-            'private_photo': row[14],
-            'price_category': row[15],
-            'nationality': row[19] if len(row) > 19 else None,
-            'islam_since': row[20] if len(row) > 20 else None,
-            'children': row[21] if len(row) > 21 else None,
+            'user_id': row['user_id'],
+            'gender': row['gender'],
+            'name': row['name'],
+            'age': row['age'],
+            'height': row['height'],
+            'weight': row['weight'],
+            'city': row['city'],
+            'marital': row['marital'],
+            'intimate': row['intimate'],
+            'religiosity': row['religiosity'],
+            'about': row['about'],
+            'seeking': row['seeking'],
+            'public_photo': row['public_photo'],
+            'private_photo': row['private_photo'],
+            'price_category': row['price_category'],
+            'nationality': row.get('nationality'),
+            'islam_since': row.get('islam_since'),
+            'children': row.get('children'),
         }
 
-        update_status(user_id, 'approved')
+        await update_status(user_id, 'approved')
 
         asyncio.create_task(publish_to_channel(data))
         asyncio.create_task(notify_user(user_id, "✅ Ваша анкета одобрена и опубликована в канале! Желаем удачи в поиске спутника жизни."))
@@ -860,7 +861,7 @@ async def reject_anketa(callback: types.CallbackQuery):
     try:
         await callback.answer()
         user_id = int(callback.data.split("_")[1])
-        update_status(user_id, 'rejected')
+        await update_status(user_id, 'rejected')
 
         await callback.message.edit_caption(
             caption="❌ Анкета отклонена.",
@@ -886,7 +887,7 @@ async def notify_user(user_id: int, text: str):
     except Exception as e:
         logging.error(f"Не удалось отправить уведомление пользователю {user_id}: {e}")
 
-# ------------------ ПУБЛИКАЦИЯ В КАНАЛ (только лайк) ------------------
+# ------------------ ПУБЛИКАЦИЯ В КАНАЛ ------------------
 async def publish_to_channel(data: dict):
     name = data.get('name', '')
     if name:
@@ -938,13 +939,12 @@ async def publish_to_channel(data: dict):
                 parse_mode="HTML",
                 reply_markup=builder.as_markup()
             )
-        update_post_message_id(user_id, sent.message_id)
+        await update_post_message_id(user_id, sent.message_id)
     except Exception as e:
         logging.error(f"Ошибка публикации в канал: {e}")
         await bot.send_message(ADMIN_ID, f"❌ Ошибка публикации в канал: {e}")
 
-# ------------------ ЛАЙКИ (с кнопкой покупки фото) ------------------
-@dp.callback_query(lambda c: c.data and c.data.startswith("like_"))
+# ------------------ ЛАЙКИ ------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("like_"))
 async def process_like(callback: types.CallbackQuery):
     try:
@@ -956,24 +956,24 @@ async def process_like(callback: types.CallbackQuery):
             await bot.send_message(from_user_id, "❌ Нельзя лайкать свою анкету.")
             return
 
-        target_data = get_user_by_id(target_user_id)
-        if not target_data or target_data[16] != 'approved':
+        target_data = await get_user_by_id(target_user_id)
+        if not target_data or target_data['status'] != 'approved':
             await bot.send_message(from_user_id, "❌ Анкета не найдена или ещё не опубликована.")
             return
 
         # Проверяем взаимность
-        mutual = get_any_like_between(from_user_id, target_user_id)
+        mutual = await get_any_like_between(from_user_id, target_user_id)
         if mutual:
-            from_data = get_user_by_id(from_user_id)
-            if from_data and "Мужской" in from_data[2]:
+            from_data = await get_user_by_id(from_user_id)
+            if from_data and "Мужской" in from_data['gender']:
                 await bot.send_message(from_user_id, "❤️ У вас уже есть взаимность с этим пользователем. Вы можете оплатить контакт.")
             else:
                 await bot.send_message(from_user_id, "❤️ Вы уже одобрили этого пользователя. Взаимность установлена.")
             return
 
-        existing = get_like(from_user_id, target_user_id)
+        existing = await get_like(from_user_id, target_user_id)
         if existing:
-            status = existing[3]
+            status = existing['status']
             if status == 'pending':
                 await bot.send_message(from_user_id, "⏳ Вы уже отправили запрос этому пользователю. Ожидайте ответа.")
             elif status == 'approved':
@@ -982,34 +982,34 @@ async def process_like(callback: types.CallbackQuery):
                 await bot.send_message(from_user_id, "❌ Пользователь отклонил ваш запрос ранее.")
             return
 
-        from_data = get_user_by_id(from_user_id)
+        from_data = await get_user_by_id(from_user_id)
         if not from_data:
             await bot.send_message(from_user_id, "❌ Ваша анкета не найдена. Заполните анкету через /start.")
             return
 
-        if not save_like(from_user_id, target_user_id):
+        if not await save_like(from_user_id, target_user_id):
             await bot.send_message(from_user_id, "❌ Ошибка при сохранении лайка.")
             return
 
-        target_gender = target_data[2]
+        target_gender = target_data['gender']
         if "Женский" in target_gender:
             recipient_text = "девушке"
         else:
             recipient_text = "мужчине"
 
-        gender_emoji_sender = "👨" if from_data[2] == "👨 Мужской" else "👩"
+        gender_emoji_sender = "👨" if from_data['gender'] == "👨 Мужской" else "👩"
         sender_text = (
             f"📋 <b>Вам поступил запрос</b>\n\n"
-            f"{gender_emoji_sender} Имя: {from_data[3]}\n"
-            f"🎂 Возраст: {from_data[4]}\n"
-            f"📏 Рост: {from_data[5]} см, Вес: {from_data[6]} кг\n"
-            f"📍 Город: {from_data[7]}\n"
-            f"🌍 Национальность: {from_data[19] if len(from_data) > 19 else '—'}\n"
-            f"🕌 Религиозность: {from_data[10]}\n"
-            f"📖 Ислам с: {from_data[20] if len(from_data) > 20 else '—'}\n"
-            f"📝 О себе: {from_data[11]}\n"
-            f"👶 Дети: {from_data[21] if len(from_data) > 21 else '—'}\n"
-            f"❤️ Ищет: {from_data[12]}\n"
+            f"{gender_emoji_sender} Имя: {from_data['name']}\n"
+            f"🎂 Возраст: {from_data['age']}\n"
+            f"📏 Рост: {from_data['height']} см, Вес: {from_data['weight']} кг\n"
+            f"📍 Город: {from_data['city']}\n"
+            f"🌍 Национальность: {from_data.get('nationality', '—')}\n"
+            f"🕌 Религиозность: {from_data['religiosity']}\n"
+            f"📖 Ислам с: {from_data.get('islam_since', '—')}\n"
+            f"📝 О себе: {from_data['about']}\n"
+            f"👶 Дети: {from_data.get('children', '—')}\n"
+            f"❤️ Ищет: {from_data['seeking']}\n"
         )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1017,7 +1017,7 @@ async def process_like(callback: types.CallbackQuery):
                 [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"rejectlike_{from_user_id}_{target_user_id}")]
             ]
         )
-        public_photo_sender = from_data[13] if len(from_data) > 13 else None
+        public_photo_sender = from_data.get('public_photo')
         if public_photo_sender:
             await bot.send_photo(
                 chat_id=target_user_id,
@@ -1034,9 +1034,8 @@ async def process_like(callback: types.CallbackQuery):
                 reply_markup=kb
             )
 
-        # Сообщение мужчине с кнопкой покупки фото (отправляем в личку)
-        woman_data = get_user_by_id(target_user_id)
-        woman_name = woman_data[3] if woman_data else ""
+        woman_data = await get_user_by_id(target_user_id)
+        woman_name = woman_data['name'] if woman_data else ""
         woman_name = woman_name[0].upper() + woman_name[1:] if woman_name else "девушки"
         photo_kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1060,32 +1059,31 @@ async def approve_like(callback: types.CallbackQuery):
     try:
         await callback.answer()
         parts = callback.data.split("_")
-        # parts: ["approvelike", "from_user_id", "to_user_id"]
         from_user_id = int(parts[1])
         to_user_id = int(parts[2])
 
-        update_like_status(from_user_id, to_user_id, 'approved')
+        await update_like_status(from_user_id, to_user_id, 'approved')
 
-        woman_data = get_user_by_id(to_user_id)
+        woman_data = await get_user_by_id(to_user_id)
         if not woman_data:
             await callback.message.delete()
             return
 
-        name = woman_data[3] or "—"
+        name = woman_data['name'] or "—"
         if name:
             name = name[0].upper() + name[1:] if len(name) > 1 else name.upper()
-        age = woman_data[4] or "—"
-        height = woman_data[5] or "—"
-        weight = woman_data[6] or "—"
-        city = woman_data[7] or "—"
-        nationality = woman_data[19] if len(woman_data) > 19 and woman_data[19] else "—"
-        marital = woman_data[8] or "—"
-        religiosity = woman_data[10] or "—"
-        islam_since = woman_data[20] if len(woman_data) > 20 and woman_data[20] else "—"
-        about = woman_data[11] or "—"
-        children = woman_data[21] if len(woman_data) > 21 and woman_data[21] else "—"
-        seeking = woman_data[12] or "—"
-        public_photo = woman_data[13] if len(woman_data) > 13 else None
+        age = woman_data['age'] or "—"
+        height = woman_data['height'] or "—"
+        weight = woman_data['weight'] or "—"
+        city = woman_data['city'] or "—"
+        nationality = woman_data.get('nationality', '—')
+        marital = woman_data['marital'] or "—"
+        religiosity = woman_data['religiosity'] or "—"
+        islam_since = woman_data.get('islam_since', '—')
+        about = woman_data['about'] or "—"
+        children = woman_data.get('children', '—')
+        seeking = woman_data['seeking'] or "—"
+        public_photo = woman_data.get('public_photo')
 
         woman_text = (
             f"👤 Имя: {name}, {age} лет\n"
@@ -1100,7 +1098,7 @@ async def approve_like(callback: types.CallbackQuery):
             f"❤️ Ищу: {seeking}\n"
         )
 
-        price_category = woman_data[15] if len(woman_data) > 15 and woman_data[15] else "700"
+        price_category = woman_data['price_category'] or "700"
         try:
             price = int(price_category)
         except:
@@ -1127,11 +1125,9 @@ async def approve_like(callback: types.CallbackQuery):
                 reply_markup=kb
             )
 
-        # Удаляем сообщение с кнопками у девушки
         await callback.message.delete()
-        # Отправляем девушке подтверждение с именем мужчины
-        from_data = get_user_by_id(from_user_id)
-        man_name = from_data[3] if from_data else "пользователь"
+        from_data = await get_user_by_id(from_user_id)
+        man_name = from_data['name'] if from_data else "пользователь"
         await callback.message.answer(
             f"✅ Вы одобрили запрос от \"{man_name}\". Мужчина получит вашу анкету и сможет связаться с вами."
         )
@@ -1153,7 +1149,7 @@ async def reject_like(callback: types.CallbackQuery):
         from_user_id = int(parts[1])
         to_user_id = int(parts[2])
 
-        update_like_status(from_user_id, to_user_id, 'rejected')
+        await update_like_status(from_user_id, to_user_id, 'rejected')
 
         try:
             await bot.send_message(
@@ -1163,11 +1159,9 @@ async def reject_like(callback: types.CallbackQuery):
         except Exception as e:
             logging.error(f"Не удалось отправить сообщение отправителю {from_user_id}: {e}")
 
-        # Удаляем сообщение с кнопками у девушки
         await callback.message.delete()
-        # Отправляем девушке подтверждение с именем мужчины
-        from_data = get_user_by_id(from_user_id)
-        man_name = from_data[3] if from_data else "пользователь"
+        from_data = await get_user_by_id(from_user_id)
+        man_name = from_data['name'] if from_data else "пользователь"
         await callback.message.answer(
             f"❌ Вы отклонили запрос от \"{man_name}\"."
         )
@@ -1180,13 +1174,9 @@ async def reject_like(callback: types.CallbackQuery):
             pass
         await callback.answer()
 
-# ------------------ ФУНКЦИИ ДЛЯ ОПЛАТЫ ЧЕРЕЗ API ЮKASSA ------------------
+# ------------------ ФУНКЦИИ ОПЛАТЫ ------------------
 async def create_yookassa_payment(amount: float, description: str, user_id: int, service_type: str, service_data: str = ""):
-    """
-    Создаёт платёж в ЮKassa и возвращает ссылку для оплаты.
-    """
     try:
-        # Создаём платёж с фиксированным return_url (юзернейм вашего бота)
         payment = Payment.create({
             "amount": {
                 "value": f"{amount:.2f}",
@@ -1194,7 +1184,7 @@ async def create_yookassa_payment(amount: float, description: str, user_id: int,
             },
             "confirmation": {
                 "type": "redirect",
-                "return_url": "https://t.me/MuslimkaNikahBot"  # замените на ваш юзернейм бота, если он отличается
+                "return_url": "https://t.me/MuslimkaNikahBot"
             },
             "capture": True,
             "description": description,
@@ -1205,31 +1195,26 @@ async def create_yookassa_payment(amount: float, description: str, user_id: int,
             }
         })
         payment_id = payment.id
-        save_pending_payment(payment_id, user_id, service_type, service_data)
+        await save_pending_payment(payment_id, user_id, service_type, service_data)
         return payment.confirmation.confirmation_url
     except Exception as e:
         logging.error(f"Ошибка создания платежа ЮKassa: {e}")
         return None
 
 async def process_successful_payment(payment_id: str, user_id: int, service_type: str, service_data: str):
-    """
-    Обрабатывает успешный платёж: предоставляет услугу.
-    """
     try:
         if service_type == "contact":
-            # service_data содержит seller_id и buyer_id через запятую
             parts = service_data.split(",")
             if len(parts) == 2:
                 seller_id = int(parts[0])
                 buyer_id = int(parts[1])
-                # Создаём чат
                 chat = await bot.create_supergroup(
                     title=f"🤝 Знакомство",
                     user_ids=[buyer_id, seller_id]
                 )
                 chat_id = chat.id
                 expires_at = datetime.now() + timedelta(hours=72)
-                save_paid_contact(buyer_id, seller_id, chat_id, expires_at)
+                await save_paid_contact(buyer_id, seller_id, chat_id, expires_at)
                 await bot.send_message(
                     chat_id=chat_id,
                     text="👋 Добро пожаловать в чат знакомства!\n"
@@ -1238,17 +1223,15 @@ async def process_successful_payment(payment_id: str, user_id: int, service_type
                 )
                 await bot.send_message(buyer_id, "✅ Оплата прошла успешно! Чат создан. Вы можете общаться.")
                 await bot.send_message(seller_id, "✅ Пользователь оплатил контакт. Чат создан. Вы можете общаться.")
-                # Удаляем из pending
-                delete_pending_payment(payment_id)
+                await delete_pending_payment(payment_id)
         elif service_type == "photo":
-            # service_data содержит seller_id и buyer_id через запятую
             parts = service_data.split(",")
             if len(parts) == 2:
                 seller_id = int(parts[0])
                 buyer_id = int(parts[1])
-                woman_data = get_user_by_id(seller_id)
+                woman_data = await get_user_by_id(seller_id)
                 if woman_data:
-                    private_photo = woman_data[14] if len(woman_data) > 14 else None
+                    private_photo = woman_data.get('private_photo')
                     if private_photo:
                         await bot.send_photo(
                             chat_id=buyer_id,
@@ -1258,13 +1241,13 @@ async def process_successful_payment(payment_id: str, user_id: int, service_type
                         await bot.send_message(buyer_id, "✅ Фото отправлено!")
                     else:
                         await bot.send_message(buyer_id, "❌ Приватное фото отсутствует.")
-                delete_pending_payment(payment_id)
+                await delete_pending_payment(payment_id)
         else:
             logging.warning(f"Неизвестный тип услуги: {service_type}")
     except Exception as e:
         logging.error(f"Ошибка в process_successful_payment: {e}")
 
-# ------------------ ОПЛАТА: КОНТАКТ (через API ЮKassa) ------------------
+# ------------------ ОПЛАТА: КОНТАКТ ------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("paycontact_"))
 async def process_pay_contact(callback: types.CallbackQuery):
     try:
@@ -1277,22 +1260,21 @@ async def process_pay_contact(callback: types.CallbackQuery):
             await callback.message.answer("❌ Это не ваша кнопка.")
             return
 
-        woman_data = get_user_by_id(seller_id)
+        woman_data = await get_user_by_id(seller_id)
         if not woman_data:
             await callback.message.answer("❌ Анкета девушки не найдена.")
             return
 
-        price_category = woman_data[15] if len(woman_data) > 15 and woman_data[15] else "700"
+        price_category = woman_data['price_category'] or "700"
         try:
             price = int(price_category)
         except:
             price = 700
 
-        # Создаём платёж через API ЮKassa
         service_data = f"{seller_id},{buyer_id}"
         payment_url = await create_yookassa_payment(
             amount=float(price),
-            description=f"Доступ к контакту",
+            description="Доступ к контакту",
             user_id=buyer_id,
             service_type="contact",
             service_data=service_data
@@ -1315,7 +1297,7 @@ async def process_pay_contact(callback: types.CallbackQuery):
         logging.error(f"Ошибка в process_pay_contact: {e}")
         await callback.message.answer("❌ Ошибка при создании счёта. Попробуйте позже.")
 
-# ------------------ ОПЛАТА: ФОТО (через API ЮKassa) ------------------
+# ------------------ ОПЛАТА: ФОТО ------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("buyphoto_"))
 async def buy_photo(callback: types.CallbackQuery):
     try:
@@ -1324,17 +1306,16 @@ async def buy_photo(callback: types.CallbackQuery):
         target_user_id = int(parts[1])
         buyer_id = int(parts[2])
 
-        woman_data = get_user_by_id(target_user_id)
+        woman_data = await get_user_by_id(target_user_id)
         if not woman_data:
             await callback.message.answer("❌ Анкета не найдена.")
             return
 
-        private_photo = woman_data[14] if len(woman_data) > 14 else None
+        private_photo = woman_data.get('private_photo')
         if not private_photo:
             await callback.message.answer("❌ У этой девушки нет приватного фото.")
             return
 
-        # Создаём платёж через API ЮKassa
         service_data = f"{target_user_id},{buyer_id}"
         payment_url = await create_yookassa_payment(
             amount=100.0,
@@ -1360,7 +1341,7 @@ async def buy_photo(callback: types.CallbackQuery):
         logging.error(f"Ошибка в buy_photo: {e}")
         await callback.message.answer("❌ Ошибка. Попробуйте позже.")
 
-# ------------------ ТЕСТОВАЯ КОМАНДА ОПЛАТЫ ЧЕРЕЗ API ------------------
+# ------------------ ТЕСТОВАЯ КОМАНДА ------------------
 @dp.message(Command("testpay"))
 async def test_pay(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1390,13 +1371,11 @@ async def test_pay(message: types.Message):
         logging.error(f"Ошибка в test_pay: {e}")
         await message.answer(f"❌ Ошибка: {e}")
 
-# ------------------ WEBHOOK-СЕРВЕР ДЛЯ ПРИЁМА УВЕДОМЛЕНИЙ ОТ ЮKASSA ------------------
+# ------------------ WEBHOOK ------------------
 async def handle_yookassa_webhook(request):
     try:
         data = await request.json()
         logging.info(f"Получен webhook: {data}")
-
-        # Проверяем, что это уведомление об успешной оплате
         if data.get('event') == 'payment.succeeded':
             payment = data.get('object')
             payment_id = payment.get('id')
@@ -1404,10 +1383,8 @@ async def handle_yookassa_webhook(request):
             user_id = int(metadata.get('user_id', 0))
             service_type = metadata.get('service_type', '')
             service_data = metadata.get('service_data', '')
-
             if payment_id and user_id:
-                # Проверяем, не обрабатывали ли уже этот платёж
-                pending = get_pending_payment(payment_id)
+                pending = await get_pending_payment(payment_id)
                 if pending:
                     await process_successful_payment(payment_id, user_id, service_type, service_data)
                 else:
@@ -1417,24 +1394,21 @@ async def handle_yookassa_webhook(request):
         logging.error(f"Ошибка в webhook: {e}")
         return web.Response(status=500, text="Internal Server Error")
 
-async def start_webhook_server():
-    """Запускает aiohttp сервер для приёма webhook-уведомлений."""
+# ------------------ ЗАПУСК ------------------
+async def main():
+    if db:
+        await db.connect()
+        await init_db()
+    # Запускаем webhook-сервер
     app = web.Application()
     app.router.add_post('/yookassa_webhook', handle_yookassa_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.environ.get('PORT', 8080))  # Render задаёт PORT
+    port = int(os.environ.get('PORT', 8080))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logging.info(f"Webhook-сервер запущен на порту {port}")
-    return runner, site
-
-# ------------------ ЗАПУСК БОТА И WEBHOOK-СЕРВЕРА ------------------
-async def main():
-    print("✅ Бот запущен!")
-    # Запускаем webhook-сервер
-    runner, site = await start_webhook_server()
-    # Запускаем бота с поллингом
+    # Запускаем бота
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
