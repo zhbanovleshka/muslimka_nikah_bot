@@ -1500,7 +1500,10 @@ async def test_pay(message: types.Message):
         logging.error(f"Ошибка в test_pay: {e}")
         await message.answer(f"❌ Ошибка: {e}")
 
-# ------------------ WEBHOOK ------------------
+# ------------------ WEBHOOK И ОБРАБОТЧИК ROOT ------------------
+async def handle_root(request):
+    return web.Response(text="Bot is alive", status=200)
+
 async def handle_yookassa_webhook(request):
     try:
         data = await request.json()
@@ -1533,9 +1536,12 @@ async def main():
     else:
         logging.warning("БД не настроена, работа без неё")
 
-    # Запускаем webhook-сервер
+    # Создаём приложение с маршрутами
     app = web.Application()
+    app.router.add_get('/', handle_root)                # для UptimeRobot
+    app.router.add_get('/health', handle_root)          # альтернативный URL
     app.router.add_post('/yookassa_webhook', handle_yookassa_webhook)
+    
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get('PORT', 8080))
