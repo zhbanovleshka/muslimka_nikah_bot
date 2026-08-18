@@ -4,7 +4,6 @@ import os
 import sys
 import re
 from datetime import datetime, timedelta
-import time
 
 import asyncpg
 from aiogram import Bot, Dispatcher, types
@@ -414,7 +413,7 @@ class RegisterForm(StatesGroup):
     private_photo = State()
     waiting_confirm = State()
 
-# ------------------ ХЭНДЛЕРЫ ------------------
+# ------------------ ХЭНДЛЕРЫ РЕГИСТРАЦИИ ------------------
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
@@ -457,9 +456,7 @@ async def edit_existing_anketa(callback: types.CallbackQuery, state: FSMContext)
     if not active:
         await callback.message.edit_text("❌ Активная анкета не найдена.")
         return
-    # Удаляем старое сообщение с inline-кнопками
     await callback.message.delete()
-    # Сохраняем ID старой анкеты и начинаем редактирование
     await state.clear()
     await state.set_state(RegisterForm.gender)
     await state.update_data(history=[], old_anketa_id=active['id'])
@@ -1309,7 +1306,7 @@ async def reject_like(callback: types.CallbackQuery):
             pass
         await callback.answer()
 
-# ------------------ ФУНКЦИИ ОПЛАТЫ ------------------
+# ------------------ ОПЛАТА ------------------
 async def create_yookassa_payment(amount: float, description: str, user_id: int, service_type: str, service_data: str = ""):
     try:
         payment = Payment.create({
@@ -1382,7 +1379,6 @@ async def process_successful_payment(payment_id: str, user_id: int, service_type
     except Exception as e:
         logging.error(f"Ошибка в process_successful_payment: {e}")
 
-# ------------------ ОПЛАТА: КОНТАКТ ------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("paycontact_"))
 async def process_pay_contact(callback: types.CallbackQuery):
     try:
@@ -1432,7 +1428,6 @@ async def process_pay_contact(callback: types.CallbackQuery):
         logging.error(f"Ошибка в process_pay_contact: {e}")
         await callback.message.answer("❌ Ошибка при создании счёта. Попробуйте позже.")
 
-# ------------------ ОПЛАТА: ФОТО ------------------
 @dp.callback_query(lambda c: c.data and c.data.startswith("buyphoto_"))
 async def buy_photo(callback: types.CallbackQuery):
     try:
@@ -1476,7 +1471,6 @@ async def buy_photo(callback: types.CallbackQuery):
         logging.error(f"Ошибка в buy_photo: {e}")
         await callback.message.answer("❌ Ошибка. Попробуйте позже.")
 
-# ------------------ ТЕСТОВАЯ КОМАНДА ------------------
 @dp.message(Command("testpay"))
 async def test_pay(message: types.Message):
     if message.from_user.id != ADMIN_ID:
@@ -1529,6 +1523,30 @@ async def handle_yookassa_webhook(request):
         logging.error(f"Ошибка в webhook: {e}")
         return web.Response(status=500, text="Internal Server Error")
 
+# ------------------ ЗАПУСК ------------------
+async def main():
+    logging.info("Запуск бота...")
+    if db:
+        logging.info("Подключение к БД...")
+        await db.connect()
+        await init_db()
+    else:
+        logging.warning("БД не настроена, работа без неё")
+
+    # Запускаем webhook-сервер
+    app = web.Application()
+    app.router.add_post('/yookassa_webhook', handle_yookassa_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get('PORT', 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Webhook-сервер запущен на порту {port}")
+
+    # Запускаем бота
+    logging.info("Запуск поллинга...")
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
@@ -1536,34 +1554,4 @@ if __name__ == "__main__":
         logging.info("Бот остановлен вручную.")
     except Exception as e:
         logging.error(f"Необработанное исключение: {e}", exc_info=True)
-        sys.exit(1)
-# ------------------ ЗАПУСК ------------------
-async def main():
-    try:
-        logging.info("Запуск бота...")
-        if db:
-            logging.info("Подключаюсь к базе данных...")
-            await db.connect()
-            await init_db()
-        else:
-            logging.warning("База данных не настроена")
-
-        # Запускаем webhook-сервер
-        app = web.Application()
-        app.router.add_post('/yookassa_webhook', handle_yookassa_webhook)
-        runner = web.AppRunner(app)
-        await runner.setup()
-        port = int(os.environ.get('PORT', 8080))
-        site = web.TCPSite(runner, '0.0.0.0', port)
-        await site.start()
-        logging.info(f"Webhook-сервер запущен на порту {port}")
-
-        # Запускаем бота
-        logging.info("Запускаю поллинг бота...")
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
-    except Exception as e:
-        logging.error(f"Критическая ошибка при запуске: {e}", exc_info=True)
-        # Ждём немного, чтобы Render успел записать логи
-        await asyncio.sleep(5)
         sys.exit(1)
