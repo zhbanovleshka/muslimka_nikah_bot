@@ -4,6 +4,7 @@ import os
 import sys
 import re
 from datetime import datetime, timedelta
+import time
 
 import asyncpg
 from aiogram import Bot, Dispatcher, types
@@ -45,7 +46,10 @@ if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
     Configuration.account_id = YOOKASSA_SHOP_ID
     Configuration.secret_key = YOOKASSA_SECRET_KEY
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=storage)
@@ -56,8 +60,18 @@ class Database:
         self.dsn = dsn
         self.pool = None
 
-    async def connect(self):
-        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+    async def connect(self, retries=5, delay=3):
+        for attempt in range(retries):
+            try:
+                self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+                logging.info("Подключение к БД успешно")
+                return
+            except Exception as e:
+                logging.error(f"Попытка {attempt+1}/{retries} подключения к БД не удалась: {e}")
+                if attempt < retries - 1:
+                    await asyncio.sleep(delay)
+                else:
+                    raise
 
     async def execute(self, query, *args):
         async with self.pool.acquire() as conn:
@@ -1515,23 +1529,41 @@ async def handle_yookassa_webhook(request):
         logging.error(f"Ошибка в webhook: {e}")
         return web.Response(status=500, text="Internal Server Error")
 
-# ------------------ ЗАПУСК ------------------
-async def main():
-    if db:
-        await db.connect()
-        await init_db()
-    app = web.Application()
-    app.router.add_post('/yookassa_webhook', handle_yookassa_webhook)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get('PORT', 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"Webhook-сервер запущен на порту {port}")
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logging.info("Бот остановлен.")
+        logging.info("Бот остановлен вручную.")
+    except Exception as e:
+        logging.error(f"Необработанное исключение: {e}", exc_info=True)
+        sys.exit(1)
+# ------------------ ЗАПУСК ------------------
+async def main():
+    try:
+        logging.info("Запуск бота...")
+        if db:
+            logging.info("Подключаюсь к базе данных...")
+            await db.connect()
+            await init_db()
+        else:
+            logging.warning("База данных не настроена")
+
+        # Запускаем webhook-сервер
+        app = web.Application()
+        app.router.add_post('/yookassa_webhook', handle_yookassa_webhook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = int(os.environ.get('PORT', 8080))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        logging.info(f"Webhook-сервер запущен на порту {port}")
+
+        # Запускаем бота
+        logging.info("Запускаю поллинг бота...")
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+    except Exception as e:
+        logging.error(f"Критическая ошибка при запуске: {e}", exc_info=True)
+        # Ждём немного, чтобы Render успел записать логи
+        await asyncio.sleep(5)
+        sys.exit(1)
